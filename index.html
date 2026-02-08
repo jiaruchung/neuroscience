@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EEG Connectivity Heatmap (Offline, Grouped)</title>
+
+<!-- LOCAL Plotly ONLY -->
+<script src="./js/plotly.min.js"></script>
+
+<style>
+:root {
+  --bg: #f5f7fb;
+  --panel: #ffffff;
+  --text: #17223b;
+  --muted: #5b6b8b;
+  --border: #d9e1f2;
+}
+body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont; }
+#panel {
+  width: 340px; padding: 16px; background: var(--panel);
+  position: fixed; top: 0; bottom: 0; overflow-y: auto;
+  border-right: 1px solid var(--border);
+}
+#plot { margin-left: 360px; height: 100vh; }
+h2 { margin-top: 0; }
+label { display:block; margin-top:12px; font-size:13px; color:var(--muted); }
+input, select { width:100%; padding:8px; margin-top:6px; border-radius:6px; border:1px solid var(--border); }
+button { width:100%; margin-top:14px; padding:10px; font-weight:bold; cursor:pointer; }
+pre { margin-top:12px; font-size:12px; white-space:pre-wrap; color:var(--muted); }
+</style>
+</head>
+
+<body>
+<div id="panel">
+  <h2>EEG Heatmap</h2>
+
+  <label>Upload data.js</label>
+  <input id="file" type="file" accept=".js">
+
+  <label>Band</label>
+  <select id="bandSelect">
+    <option value="alpha" selected>Alpha (8–12 Hz)</option>
+    <option value="theta">Theta (4–8 Hz)</option>
+    <option value="beta">Beta (13–30 Hz)</option>
+  </select>
+
+  <label>Epoch length (seconds)</label>
+  <input id="epochInput" type="number" step="0.25" value="1">
+
+  <label>Min epochs (for stability)</label>
+  <input id="minEpochs" type="number" step="1" value="3">
+
+  <label>Swap red/blue?</label>
+  <select id="swapRB">
+    <option value="yes" selected>Yes (red↔blue)</option>
+    <option value="no">No (default RdBu)</option>
+  </select>
+
+  <button onclick="run()">Compute Heatmap</button>
+
+  <pre id="status">Waiting for data.js…</pre>
+</div>
+
+<div id="plot"></div>
+
+<script>
+/* ==============================
+   REGION DEFINITIONS + COLORS
+   (HR only used if present)
+============================== */
+const REGION_MAP = [
+  { name: "Prefrontal", color: "#b87333", channels: ["Fp1","Fp2"] },
+  { name: "Frontal",    color: "#c9a500", channels: ["F7","F3","Fz","F4","F8"] },
+  { name: "Temporal",   color: "#b30059", channels: ["T3","T4","T5","T6"] },
+  { name: "Central",    color: "#006d5b", channels: ["C3","Cz","C4"] },
+  { name: "Parietal",   color: "#6a1b9a", channels: ["P3","Pz","P4"] },
+  { name: "Occipital",  color: "#003b8e", channels: ["O1","O2"] },
+  { name: "Other",      color: "#333333", channels: ["HR"] }, // only if HR exists
+];
+
+function parseData(text) {
+  const m = text.match(/const\s+data\s*=\s*(\{[\s\S]*\})/);
+  if (!m) throw "Invalid data.js format";
+  return JSON.parse(m[1]);
+}
+
+function transpose2D(arr) {
+  const rows = arr.length, cols = arr[0].length;
+  const out = Array.from({ length: cols }, () => new Array(rows));
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[c][r] = arr[r][c];
+  return out;
+}
+
+/* ==============================
+   “SAFE” BAND ENERGY (NO FFT)
+============================== */
+function bandEnergy(signal, fs, f0, f1) {
+  const N = signal.length;
+  let mean = 0;
+  for (let i = 0; i < N; i++) mean += signal[i];
+  mean /= (N || 1);
+
+  let e = 0;
+  for (let i = 0; i < N; i++) {
+    const t = i / fs;
+    const w = Math.sin(2*Math.PI*f0*t) + Math.sin(2*Math.PI*f1*t);
+    e += (signal[i] - mean) * w;
+  }
+  return Math.log(Math.abs(e) + 1e-9);
+}
+
+function corr(a, b) {
+  let sa = 0, sb = 0, sab = 0;
+  for (let i = 0; i < a.length; i++) {
+    sa += a[i] * a[i];
+    sb += b[i] * b[i];
+    sab += a[i] * b[i];
+  }
+  return sab / Math.sqrt(sa * sb + 1e-12);
+}
+
+function bandRange(bandSel) {
+  if (bandSel === "alpha") return [8,12];
+  if (bandSel === "theta") return [4,8];
+  return [13,30]; // beta
+}
+
+/* ==============================
+   ORDER CHANNELS BY REGION
+   Returns orderedLabels + boundaries
+============================== */
+function orderByRegion(labels) {
+  const ordered = [];
+  const bounds = []; // {name,color,start,end}
+  let pos = 0;
+
+  for (const reg of REGION_MAP) {
+    const present = reg.channels.filter(ch => labels.includes(ch));
+    if (!present.length) continue;
+
+    const start = pos;
+    ordered.push(...present);
+    pos += present.length;
+    bounds.push({ name: reg.name, color: reg.color, start, end: pos });
+  }
+
+  const leftover = labels.filter(ch => !ordered.includes(ch));
+  if (leftover.length) {
+    const start = pos;
+    ordered.push(...leftover);
+    pos += leftover.length;
+    bounds.push({ name: "Other", color: "#333333", start, end: pos });
+  }
+
+  return { ordered, bounds };
+}
+
+/* ==============================
+   MAIN RUN
+============================== */
+async function run() {
+  const status = document.getElementById("status");
+
+  if (!window.Plotly) {
+    status.textContent = "❌ Plotly not loaded. Check ./js/plotly.min.js path.";
+    return;
+  }
+
+  const file = document.getElementById("file").files[0];
+  if (!file) {
+    status.textContent = "Please choose a data.js file first.";
+    return;
+  }
+
+  status.textContent = "Reading data.js…";
+  const text = await file.text();
+
+  let data;
+  try {
+    data = parseData(text);
+  } catch (e) {
+    status.textContent = "❌ " + e;
+    return;
+  }
+
+  const fs = Number(data.sampling_rate_hz);
+  let X = data.data;
+  let labels = data.channels; // IMPORTANT: let (we may fix length)
+
+  if (!fs || !labels || !X) {
+    status.textContent = "Missing required fields: sampling_rate_hz, channels, data";
+    return;
+  }
+
+  // Basic shape
+  let rows = X.length;
+  let cols = Array.isArray(X[0]) ? X[0].length : 0;
+
+  // Auto-detect transpose: if X looks like samples×channels
+  // We use labels.length as a hint ONLY, then reconcile to X after.
+  const nChHint = labels.length;
+
+  if (cols === nChHint && rows !== nChHint) {
+    status.textContent = "Detected transposed data (samples × channels). Transposing…";
+    X = transpose2D(X);
+    rows = X.length;
+    cols = X[0].length;
+  }
+
+  // Now trust the actual data channel count
+  const nChData = X.length;
+
+  // Reconcile labels length to data channels (fixes your 20 vs 21 bug)
+  if (labels.length !== nChData) {
+    let msg = `⚠️ Channel mismatch: labels=${labels.length} vs dataChannels=${nChData}. Fixing labels to match data.\n`;
+    if (labels.length > nChData) {
+      labels = labels.slice(0, nChData);
+      msg += `- Sliced labels to first ${nChData}.\n`;
+    } else {
+      // pad with generic names if labels are missing
+      const padded = labels.slice();
+      for (let i = labels.length; i < nChData; i++) padded.push(`Ch${i+1}`);
+      labels = padded;
+      msg += `- Padded labels up to ${nChData}.\n`;
+    }
+    status.textContent = msg;
+  }
+
+  const epochSec = Number(document.getElementById("epochInput").value);
+  const epochN = Math.max(8, Math.floor(epochSec * fs));
+  const minEpochs = Math.max(1, Number(document.getElementById("minEpochs").value || 1));
+
+  if (cols < epochN) {
+    status.textContent =
+      `Not enough samples for epoch.\n` +
+      `samples=${cols}, epochN=${epochN}.\n` +
+      `Try epoch=0.5 or 0.25.`;
+    return;
+  }
+
+  const nEpochs = Math.floor(cols / epochN);
+
+  status.textContent +=
+    `Loaded ✓\nfs=${fs} Hz\nchannels=${nChData}\ndata shape=${rows}×${cols}\n` +
+    `epochSec=${epochSec}, epochN=${epochN}\n` +
+    `nEpochs=${nEpochs}\n`;
+
+  if (nEpochs < minEpochs) {
+    status.textContent += `\n⚠️ Not enough data for stable estimate (need >= ${minEpochs} epochs). Lower epoch length or use longer segment.\n`;
+  }
+
+  const bandSel = document.getElementById("bandSelect").value;
+  const [f0, f1] = bandRange(bandSel);
+
+  // Order channels by region (based on reconciled labels)
+  const { ordered, bounds } = orderByRegion(labels);
+  const idx = ordered.map(ch => labels.indexOf(ch));
+
+  // Safety: ensure idx valid
+  if (idx.some(i => i < 0 || i >= nChData)) {
+    status.textContent += `\n❌ Internal error: ordered channel index out of range.`;
+    return;
+  }
+
+  status.textContent += `\nOrdering by region: ${ordered.join(", ")}\nComputing features…`;
+
+  // Compute features per channel (log band energy per epoch)
+  const features = [];
+  for (let ii = 0; ii < idx.length; ii++) {
+    const c = idx[ii];
+    const sig = X[c];
+    const row = [];
+    for (let e = 0; e < nEpochs; e++) {
+      const start = e * epochN;
+      const seg = sig.slice(start, start + epochN);
+      row.push(bandEnergy(seg, fs, f0, f1));
+    }
+    features.push(row);
+  }
+
+  status.textContent += `\nComputing correlation…`;
+
+  // Correlation matrix (NxN)
+  const N = features.length;
+  const C = Array.from({ length: N }, (_, i) =>
+    Array.from({ length: N }, (_, j) => corr(features[i], features[j]))
+  );
+
+  // Make diagonal white like the reference heatmap
+  for (let i = 0; i < N; i++) C[i][i] = null;
+
+  // Final sanity check before plotting
+  if (!C.length || C.length !== ordered.length || C[0].length !== ordered.length) {
+    status.textContent += `\n❌ Heatmap matrix shape mismatch: z=${C.length}×${(C[0]||[]).length}, labels=${ordered.length}`;
+    return;
+  }
+
+  // Heatmap separators
+  const sepShapes = [];
+  for (const b of bounds) {
+    if (b.start === 0) continue;
+    sepShapes.push({
+      type: "line",
+      xref: "x2", yref: "y2",
+      x0: b.start - 0.5, x1: b.start - 0.5,
+      y0: -0.5, y1: ordered.length - 0.5,
+      line: { color: "#000000", width: 2 }
+    });
+    sepShapes.push({
+      type: "line",
+      xref: "x2", yref: "y2",
+      x0: -0.5, x1: ordered.length - 0.5,
+      y0: b.start - 0.5, y1: b.start - 0.5,
+      line: { color: "#000000", width: 2 }
+    });
+  }
+
+  // Region banner shapes + labels (TOP ROW)
+  const bannerShapes = [];
+  const bannerAnn = [];
+  for (const b of bounds) {
+    bannerShapes.push({
+      type: "rect",
+      xref: "x", yref: "y",
+      x0: b.start - 0.5, x1: b.end - 0.5,
+      y0: 0, y1: 1,
+      fillcolor: b.color,
+      line: { width: 0 }
+    });
+    bannerAnn.push({
+      xref: "x", yref: "y",
+      x: (b.start + b.end - 1) / 2,
+      y: 0.5,
+      text: `<b>${b.name}</b>`,
+      showarrow: false,
+      font: { color: "white", size: 14 }
+    });
+  }
+
+  // Bottom banner shapes + labels
+  const bottomBannerShapes = [];
+  const bottomBannerAnn = [];
+  for (const b of bounds) {
+    bottomBannerShapes.push({
+      type: "rect",
+      xref: "x3", yref: "y3",
+      x0: b.start - 0.5, x1: b.end - 0.5,
+      y0: 0, y1: 1,
+      fillcolor: b.color,
+      line: { width: 0 }
+    });
+    bottomBannerAnn.push({
+      xref: "x3", yref: "y3",
+      x: (b.start + b.end - 1) / 2,
+      y: 0.5,
+      text: `<b>${b.name}</b>`,
+      showarrow: false,
+      font: { color: "white", size: 14 }
+    });
+  }
+
+  // Left/right region bars
+  const sideShapes = [];
+  const sideAnn = [];
+  for (const b of bounds) {
+    sideShapes.push({
+      type: "rect",
+      xref: "x4", yref: "y2",
+      x0: 0, x1: 1,
+      y0: b.start - 0.5, y1: b.end - 0.5,
+      fillcolor: b.color,
+      line: { width: 0 }
+    });
+    sideShapes.push({
+      type: "rect",
+      xref: "x5", yref: "y2",
+      x0: 0, x1: 1,
+      y0: b.start - 0.5, y1: b.end - 0.5,
+      fillcolor: b.color,
+      line: { width: 0 }
+    });
+    sideAnn.push({
+      xref: "x4", yref: "y2",
+      x: 0.5,
+      y: (b.start + b.end - 1) / 2,
+      text: `<b>${b.name}</b>`,
+      showarrow: false,
+      textangle: -90,
+      font: { color: "white", size: 12 }
+    });
+    sideAnn.push({
+      xref: "x5", yref: "y2",
+      x: 0.5,
+      y: (b.start + b.end - 1) / 2,
+      text: `<b>${b.name}</b>`,
+      showarrow: false,
+      textangle: 90,
+      font: { color: "white", size: 12 }
+    });
+  }
+
+  // Swap red/blue?
+  const swapRB = document.getElementById("swapRB").value === "yes";
+  // Plotly "RdBu" + reversescale:true flips the mapping (red<->blue)
+  const reverseScale = swapRB;
+
+  const bannerTrace = {
+    type: "heatmap",
+    z: [Array(ordered.length).fill(0)],
+    x: ordered,
+    y: [""],
+    showscale: false,
+    hoverinfo: "skip",
+    colorscale: [[0, "#000000"], [1, "#000000"]],
+    xaxis: "x",
+    yaxis: "y"
+  };
+
+  const bottomBannerTrace = {
+    type: "heatmap",
+    z: [Array(ordered.length).fill(0)],
+    x: ordered,
+    y: [""],
+    showscale: false,
+    hoverinfo: "skip",
+    colorscale: [[0, "#000000"], [1, "#000000"]],
+    xaxis: "x3",
+    yaxis: "y3"
+  };
+
+  const leftBarTrace = {
+    type: "heatmap",
+    z: Array.from({ length: ordered.length }, () => [0]),
+    x: [""],
+    y: ordered,
+    showscale: false,
+    hoverinfo: "skip",
+    colorscale: [[0, "#000000"], [1, "#000000"]],
+    xaxis: "x4",
+    yaxis: "y2"
+  };
+
+  const rightBarTrace = {
+    type: "heatmap",
+    z: Array.from({ length: ordered.length }, () => [0]),
+    x: [""],
+    y: ordered,
+    showscale: false,
+    hoverinfo: "skip",
+    colorscale: [[0, "#000000"], [1, "#000000"]],
+    xaxis: "x5",
+    yaxis: "y2"
+  };
+
+  const heatmapTrace = {
+    type: "heatmap",
+    z: C,
+    x: ordered,
+    y: ordered,
+    zmin: -1,
+    zmax: 1,
+    colorscale: "RdBu",
+    reversescale: reverseScale,
+    colorbar: {
+      title: { text: "Correlation", font: { color: "#1b2b4f" } },
+      tickfont: { color: "#1b2b4f" }
+    },
+    hovertemplate: "x=%{x}<br>y=%{y}<br>corr=%{z:.3f}<extra></extra>",
+    xaxis: "x2",
+    yaxis: "y2"
+  };
+
+  const layout = {
+    paper_bgcolor: "#f5f7fb",
+    plot_bgcolor: "#f5f7fb",
+    margin: { l: 130, r: 130, t: 90, b: 120 },
+    height: window.innerHeight,
+
+    title: {
+      text: `EEG Connectivity Heatmap (Correlation of ${bandSel.toUpperCase()} Power Fluctuations)<br><span style="font-size:14px">Grouped by Brain Areas</span>`,
+      font: { color: "#1b2b4f", size: 20 }
+    },
+
+    // Top banner axes
+    xaxis: {
+      domain: [0.08, 0.92],
+      anchor: "y",
+      tickfont: { color: "#1b2b4f", size: 11 },
+      tickangle: 0,
+      showgrid: false,
+      zeroline: false,
+      showline: false
+    },
+    yaxis: {
+      domain: [0.86, 0.92],
+      anchor: "x",
+      showticklabels: false,
+      showgrid: false,
+      zeroline: false
+    },
+
+    // Heatmap axes
+    xaxis2: {
+      domain: [0.08, 0.92],
+      anchor: "y2",
+      tickfont: { color: "#1b2b4f", size: 11 },
+      tickangle: 90,
+      showgrid: false
+    },
+    yaxis2: {
+      domain: [0.08, 0.84],
+      anchor: "x2",
+      tickfont: { color: "#1b2b4f", size: 11 },
+      autorange: "reversed",
+      showgrid: false
+    },
+
+    // Bottom banner axes
+    xaxis3: {
+      domain: [0.08, 0.92],
+      anchor: "y3",
+      showgrid: false,
+      zeroline: false,
+      showline: false,
+      showticklabels: false
+    },
+    yaxis3: {
+      domain: [0.00, 0.06],
+      anchor: "x3",
+      showticklabels: false,
+      showgrid: false,
+      zeroline: false
+    },
+
+    // Left and right bars
+    xaxis4: {
+      domain: [0.00, 0.06],
+      anchor: "y2",
+      showticklabels: false,
+      showgrid: false,
+      zeroline: false
+    },
+    xaxis5: {
+      domain: [0.94, 1.00],
+      anchor: "y2",
+      showticklabels: false,
+      showgrid: false,
+      zeroline: false
+    },
+
+    shapes: [...bannerShapes, ...bottomBannerShapes, ...sideShapes, ...sepShapes],
+    annotations: [...bannerAnn, ...bottomBannerAnn, ...sideAnn]
+  };
+
+  Plotly.newPlot("plot", [bannerTrace, heatmapTrace, bottomBannerTrace, leftBarTrace, rightBarTrace], layout, { responsive: true });
+
+  status.textContent += "\nDone ✓";
+}
+</script>
+</body>
+</html>
